@@ -1,6 +1,6 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** Senior AI Systems & Infrastructure Engineer · **Date:** 2026-11-07 · **Hours actually spent:** ~18 hours · **Language / storage:** Python 3.12 (standard library + `httpx`) / SQLite 3 WAL (`controller_state.db`)
+**Name:** Matta Nivas · **Date:** 2026-11-07 · **Hours actually spent:** ~15 hours · **Language / storage:** Python 3.12 (standard library + `httpx`) / SQLite 3 WAL (`controller_state.db`)
 
 ---
 
@@ -26,20 +26,21 @@ The controller is an always-on, crash-resilient HTTP control loop that optimizes
 
 | # | Capability | Built / Partial / Cut | Why | What it would take to finish |
 |---|---|---|---|---|
-| C1 | Always-On Controller Loop | **Built** | Core driver required to advance simulation and handle events via HTTP. | Fully complete. |
-| C2 | History Bootstrapper | **Built** | Required for Day 0 cold-start scheduling, baseline rates, and prior parameters. | Fully complete. |
-| C3 | Cohort Discovery & Sizing | **Built** | Segments traffic into robust demographic groups (≥ 6% share, ≥ 200 calls) avoiding fragmentation. | Fully complete. |
-| C4 | Call-Time Optimizer | **Built** | Shifts dial volume to cohort-specific empirical pickup peak hours. | Fully complete. |
-| C5 | Caller-ID Health & Rotation | **Built** | Detects spam flagging vs concurrent peers and balances load across healthy numbers. | Fully complete. |
-| C6 | Safe Multi-Arm Bandit | **Built** | Empirical Bayes + Benjamini-Hochberg FDR control with conservative canary exploration. | Fully complete. |
-| C7 | Decay Detector & Rollback | **Built** | Detects novelty fatigue on variants (e.g. W3) and rolls back immediately to incumbent. | Fully complete. |
-| C8 | Incident Responder | **Built** | Catches hallucination spikes, selects grounded LLM fixes via `/llm`, and validates before proposing. | Fully complete. |
-| C9 | Governance Engine | **Built** | Batches requests, respects approver hours, latency, apply windows, and 24h fatigue quotas. | Fully complete. |
-| C10 | Dry-Run & Impact Scorer | **Built** | Projects pickup/engagement delta and affected lead counts on historical replay populations. | Fully complete. |
-| C11 | Supervisor CLI View | **Built** | Provides a single unified operations CLI screen (`python -m controller.cli supervisor-view`). | Fully complete. |
-| C12 | Audit Trail & Explainer CLI | **Built** | Full SQLite WAL query engine answering who changed what, when, why, and post-apply KPIs. | Fully complete. |
-| C13 | Crash Recovery & Idempotency | **Built** | Tested kill/restart recovery with zero double-apply, zero lapsed approvals, zero 409 conflicts. | Fully complete. |
-| C14 | Lead Preferred Hour Sched. | **Cut** | Per-lead scheduling adds high memory state with negligible lift over cohort-level hourly optimization. | Track individual lead response history in an external feature store. |
+| C1 | Event ingestion at load-scenario scale (backlog-safe, idempotent, restartable) | **Built** | Foundation for fresh decisions at 650k dials/day (`87,450` events/sec streamed with chunk/event checkpoints). | Fully complete. |
+| C2 | Lead/feature joins & one shared `Cohort` object across detection, experiments & supervisor view | **Built** | Eliminates train/serve skew between discovery, Empirical Bayes bandits, dry-runs, and operator views. | Fully complete. |
+| C3 | Bootstrapping from 14-day history before D0 | **Built** | Solves cold-start for cohort boundaries, hourly pickup curves, DID health baselines, and prompt error priors. | Fully complete. |
+| C4 | Call-time optimisation: per cohort and/or per person | **Partial** | Built per-cohort comparative-advantage `hour_weights`; cut per-person `lead_preferred_hour` to hold RAM at `32 MB` RSS instead of multi-GB per-lead state for marginal extra lift. | Persist per-lead answer history in a partitioned KV store and emit sparse `lead_preferred_hour` overrides for high-value leads. |
+| C5 | Caller-ID health: detect degradation, rotate, explore safely | **Built** | Peer-normalized sliding-window detector isolates spam-flagged DIDs (`0.0` share from D3 onward) without diurnal false alarms. | Fully complete. |
+| C6 | Variant experimentation on welcome message & voice (sample sizes, multiple comparisons) | **Built** | Empirical Bayes cell shrinkage + Benjamini-Hochberg FDR ($\alpha = 0.08$) prevents small-sample false winners. | Fully complete. |
+| C7 | Winner promotion, decay detection and rollback | **Built** | Sliding-window peak-drop detector rolls back novelty-fatigued arms (`W3` share `0.0` across D3–D9) immediately. | Fully complete. |
+| C8 | Hallucination incident response (detect → LLM suggest → validate → propose → verify) | **Built** | Protects regulated BFSI workflows (`120m` MTTR on `ks_cancel`, `6` credits spent, post-apply verification on 50+ calls). | Fully complete. |
+| C9 | Governance client (lifecycle, batching, approver hours, expiry/lapse, stale-base, auto-apply) | **Built** | Non-negotiable client boundary: `0` conflicts, `0` lapsed approvals, `0` rejected auto-applies across all scenarios. | Fully complete. |
+| C10 | Honest impact scores, affected-lead counts, and dry runs against historical cohorts | **Built** | Gives supervisors transparent pickup/engagement replay projections and suppresses low-impact churn (`< 0.08`). | Fully complete. |
+| C11 | Consolidated supervisor view (`python -m controller.cli supervisor-view`) | **Built** | Replaces alert noise with one ranked operations screen of pending approvals, 24h changes, and active incidents. | Fully complete. |
+| C12 | Queryable decision/audit store (`python -m controller.cli explain`) | **Built** | Answers who changed what, when, why, validation evidence, and post-apply KPI impact purely from SQLite WAL records. | Fully complete. |
+| C13 | Crash recovery, demonstrated (`scripts/demonstrate_crash_recovery.py`) | **Built** | Verified `os._exit(137)` mid-run kill & resume with zero duplicate ingestion, zero conflicts, and clean completion. | Fully complete. |
+| C14 | Loop observability: ingest lag, tick latency, credit burn, actionable alerts | **Built** | Persists per-tick telemetry in `loop_metrics` and exposes p50/p95 lag, RSS memory, credits, and alerts via `cli health`. | Fully complete. |
+| C15 | Fair allocation of credits and approver attention across tenants | **Partial** | Built per-workflow fatigue headroom (1–2 req/24h) and a 20-credit reserve floor; cut dynamic cross-tenant credit auctions since incident resolution uses only 6 of 200 credits. | Add a token-bucket credit scheduler weighted by tenant SLA tier when onboarding 100+ concurrent workflows. |
 
 **Guiding Principle:** *Safety, governance compliance, and statistical explainability over unbounded algorithmic complexity.* In regulated BFSI workflows, an unexplainable 1% lift is a compliance liability; an automated guardrail that prevents an ungrounded prompt from hallucinating on 10,000 customers is a company-saving asset.
 

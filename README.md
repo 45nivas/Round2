@@ -1,4 +1,94 @@
-# Outcome-First Agent Loop — Senior Engineer Assignment
+# Outcome-First Agent Loop — Controller & Evaluation Guide
+
+Always-on, crash-resilient HTTP controller (`controller/`) that drives outbound voice workflows across cohort discovery, hourly call-time optimization, caller-ID spam isolation, Empirical Bayes variant experimentation, decay rollback, hallucination incident mitigation, and strict client governance, backed by an embedded SQLite WAL audit store (`controller_state.db`).
+
+- **Design & Stakeholder Write-Up:** [SUBMISSION.md](SUBMISSION.md)
+- **Evaluation & Benchmark Reports:** [reports/public_01.md](reports/public_01.md) · [reports/public_02.md](reports/public_02.md) · [reports/public_03_load.md](reports/public_03_load.md) · [reports/crash_recovery.log](reports/crash_recovery.log)
+
+### Headline Results
+
+| Scenario / Test | Key Results | Governance & Safety Hygiene |
+|---|---|---|
+| `public_01_dev` | **+6.0%** ALL conclusion (`+36.0%` `nw_kyc`), **+4.4%** engagement; decaying `W3` purged to **`0.0` share** on Days 3–7 | `0` conflicts · `0` lapsed · `0` expired · `0` rejected auto-applies |
+| `public_02_incidents` | **+26.5%** ALL conclusion (`+39.1%` `ks_cancel`, `+26.5%` `nw_kyc`, `+17.2%` `nw_renewal`), **+22.0%** pickup; hallucinated calls cut **`431 → 151`** (`ks_cancel`: `348 → 71`) | Flagged `D2` at **`0.0` share** Days 3–9 · `P2 → P3` resolved in **`120m` MTTR** spending **`6 / 200` credits** |
+| `public_03_load` | **`87,450` events/sec** history ingest · **`68,751` events/sec** live ingest · **`p95 = 398.7 ms`** 12-workflow tick lag · **`32.0 MB` RSS** peak RAM · **`16.12 s/day`** controller wall time | `0` conflicts · `0` lapsed · `0` rejected auto-applies across 12 workflows |
+| Crash Recovery | Hard kill (`os._exit(137)`) at `sim_minute=4800` and resume from SQLite WAL to `sim_minute=11520` | `0` duplicate chunks · `0` conflicts · `0` lost approvals |
+
+---
+
+## Quickstart & Runbook
+
+### 1. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+*(Zero extra third-party packages required — built strictly on Python 3.11+ standard library + `httpx`.)*
+
+### 2. Run a Scenario End-to-End
+```bash
+# 1. Generate no-op baseline
+python -m sim baseline --scenario scenarios/public_02_incidents.yaml --run-dir runs/base02
+
+# 2. Start simulator HTTP server (Terminal 1, default :8700)
+python -m sim serve --scenario scenarios/public_02_incidents.yaml --run-dir runs/mine02 --port 8700 --force
+
+# 3. Run the controller until scenario completion (Terminal 2 — zero manual steps)
+./run.sh http://127.0.0.1:8700
+# Cross-platform / custom DB path alternative:
+# python -m controller --url http://127.0.0.1:8700 --db controller_state.db
+
+# 4. Grade controller run against baseline
+python -m sim grade --run runs/mine02 --baseline runs/base02 --out reports/public_02.md
+```
+
+### 3. Audit, Supervisor & Health CLI (`controller.cli`)
+Query the controller's own SQLite WAL store (`controller_state.db`) at any time during or after a run:
+```bash
+# Explain every change on a workflow: who approved it, rationale, validation evidence, diff, dry-run & post-apply KPIs
+python -m controller.cli explain --db controller_state.db --workflow ks_cancel
+python -m controller.cli explain --db controller_state.db --workflow ks_cancel --at 2027-01-07T12:00
+
+# Single-screen consolidated operations view across all workflows (pending requests, 24h changes, incidents)
+python -m controller.cli supervisor-view --db controller_state.db
+
+# Loop observability: total events ingested, p50/p95/max tick latency, peak RSS memory, remaining credits & alerts
+python -m controller.cli health --db controller_state.db
+```
+
+### 4. Tests, Crash-Recovery Proof & Scale Benchmark
+```bash
+# Run simulator + controller unit/integration test suite
+python -m pytest -v tests
+
+# Demonstrate mid-run hard kill (exit 137 at t=4800m) and seamless SQLite WAL restart
+PYTHONPATH=. python scripts/demonstrate_crash_recovery.py
+
+# Run 12-workflow load benchmark (scenarios/public_03_load.yaml) and write reports/public_03_load.md
+PYTHONPATH=. python scripts/benchmark_load.py
+```
+
+### 5. Controller Architecture & Extension Guide
+```text
+controller/
+├── __main__.py          # Entrypoint (`python -m controller --url <SIM_URL>`)
+├── config.py            # Statistical thresholds, canary floors, governance & credit guardrails
+├── models.py            # Shared immutable Cohort abstraction, WorkflowStats, ProposalDraft
+├── store.py             # Crash-safe SQLite WAL checkpoint, proposal, incident & decision audit store
+├── ingestor.py          # Streaming NDJSON ingestor + 1-byte bytearray lead feature interning
+├── cohort_engine.py     # Day-0 history bootstrapper, non-fragmenting cohort discovery & hour_weights
+├── stats_engine.py      # Empirical Bayes shrinkage, Benjamini-Hochberg FDR, decay & peer-DID detectors
+├── incident_manager.py  # Sequential prompt hallucination detector, /llm fix scorer & /validation runner
+├── governance.py        # Proposal state machine, fatigue/window scheduler, TVD auto-apply & replay dry-run
+├── engine.py            # Main tick orchestration, supervisor override grace window & post-apply verifier
+└── cli.py               # `explain`, `supervisor-view`, and `health` operator CLI commands
+```
+- **Tuning statistical sensitivity or credit floors:** edit `ControllerParams` in `controller/config.py`.
+- **Adding a new lead feature dimension or cohort rule:** extend `Cohort.matches()` in `controller/models.py` and candidate generation in `controller/cohort_engine.py`.
+- **Adding a new anomaly detector:** implement the check over `WorkflowStats` in `controller/stats_engine.py` or `controller/incident_manager.py` and route resulting target diffs through `GovernanceManager` (`controller/governance.py`).
+
+---
+
+# Outcome-First Agent Loop — Senior Engineer Assignment (Original Specification)
 
 **Formi · Agentic Universe** · Greenfield · Suggested effort 12–16 hours across 7 calendar days
 
