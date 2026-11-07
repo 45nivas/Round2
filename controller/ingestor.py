@@ -331,8 +331,8 @@ class EventIngestor:
                                     acc.variant_recent_window[key] = vw
                                 vw.append(eng)
 
-                                # Update peak rolling rate once we have a solid sample (>= 90 calls)
-                                if len(vw) >= 90:
+                                # Update peak rolling rate once we have a solid sample (>= 45 calls)
+                                if len(vw) >= 45:
                                     cur_rate = sum(vw) / len(vw)
                                     prev_peak = acc.variant_peak_rate.get(key, 0.0)
                                     if cur_rate > prev_peak:

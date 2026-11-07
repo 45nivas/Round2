@@ -1,4 +1,4 @@
-"""Statistical engine for variant experimentation, Empirical Bayes shrinkage, DID health, and decay rollback (C5, C6, C7)."""
+"""Statistical engine for variant experimentation, covariate-adjusted Empirical Bayes, DID health, and decay rollback (C5, C6, C7)."""
 import math
 from typing import Any
 
@@ -52,53 +52,52 @@ class StatsEngine:
         self.cohort_engine = CohortEngine(cfg)
 
     # -------------------------------------------------------------------------
-    # C5: Caller-ID Health Detection, Safe Exploration, and Rotation
+    # C5: Caller-ID Health Detection and Load-Balanced Rotation
     # -------------------------------------------------------------------------
     def detect_degraded_dids(self, acc: WorkflowAccumulator, options_dids: list[str]) -> set[str]:
-        """Detect caller IDs whose recent pickup rate has degraded significantly below peers or history."""
-        recent_rates: dict[str, tuple[float, int, int]] = {}
+        """Detect caller IDs whose pickup rate is degraded relative to concurrent healthy peer DIDs (C5).
+        Comparing against concurrent peer DIDs inherently controls for diurnal variation and campaign mix.
+        """
+        recent_stats: dict[str, tuple[int, int, float]] = {}
         for did in options_dids:
             win = acc.did_recent_window.get(did)
-            if win and len(win) >= self.cfg.did_min_dials_for_health:
-                s = sum(win)
-                n = len(win)
-                recent_rates[did] = (s / n, s, n)
-            else:
-                live = acc.live_did_pickup.get(did, [0, 0])
-                if live[0] >= self.cfg.did_min_dials_for_health:
-                    recent_rates[did] = (live[1] / live[0], live[1], live[0])
+            if win and len(win) >= 35:
+                recent_slice = list(win)[-120:]
+                s = sum(recent_slice)
+                n = len(recent_slice)
+                recent_stats[did] = (s, n, s / n)
 
-        if not recent_rates:
+        if not recent_stats:
             return set(acc.degraded_dids)
 
-        best_did = max(recent_rates.keys(), key=lambda d: recent_rates[d][0])
-        best_rate, best_s, best_n = recent_rates[best_did]
-
         newly_degraded: set[str] = set()
-        for did, (r, s, n) in recent_rates.items():
-            # Compare against best active peer DID in recent window
-            if did != best_did:
-                drop_vs_best = best_rate - r
-                z_vs_best = two_prop_z(s, n, best_s, best_n)
-                if drop_vs_best >= self.cfg.did_degradation_drop and z_vs_best <= self.cfg.did_degradation_z:
-                    newly_degraded.add(did)
-                    continue
+        for did, (s, n, r) in recent_stats.items():
+            if did in acc.degraded_dids:
+                continue
 
-            # Compare against DID's own historical pickup baseline
-            hist = acc.history_did_pickup.get(did, [0, 0])
-            if hist[0] >= 200:
-                hist_rate = hist[1] / hist[0]
-                drop_vs_hist = hist_rate - r
-                z_vs_hist = two_prop_z(s, n, hist[1], hist[0])
-                if drop_vs_hist >= self.cfg.did_degradation_drop + 0.01 and z_vs_hist <= self.cfg.did_degradation_z:
-                    newly_degraded.add(did)
+            # Concurrent peer DIDs that are not already degraded
+            peers = [
+                o for o in options_dids
+                if o != did and o not in acc.degraded_dids and o in recent_stats
+            ]
+            if not peers:
+                continue
 
-        # If a previously degraded DID was probed and recovered close to best_rate, unflag it; otherwise keep flagged
-        for prev_d in list(acc.degraded_dids):
-            if prev_d in recent_rates:
-                r, s, n = recent_rates[prev_d]
-                if best_rate - r < 0.03:
-                    acc.degraded_dids.discard(prev_d)
+            peer_s = sum(recent_stats[o][0] for o in peers)
+            peer_n = sum(recent_stats[o][1] for o in peers)
+            if peer_n < 40:
+                continue
+
+            peer_r = peer_s / peer_n
+            if peer_r < 0.14:
+                continue
+
+            drop_vs_peer = peer_r - r
+            z_vs_peer = two_prop_z(s, n, peer_s, peer_n)
+
+            # Degraded if pickup rate is <= 58% of concurrent healthy peers with high statistical confidence
+            if r <= 0.58 * peer_r and drop_vs_peer >= 0.075 and z_vs_peer <= -2.40:
+                newly_degraded.add(did)
 
         acc.degraded_dids |= newly_degraded
         return set(acc.degraded_dids)
@@ -109,98 +108,55 @@ class StatsEngine:
         wf_meta: dict[str, Any],
         current_did_alloc: dict[str, float],
     ) -> dict[str, float]:
-        """Compute safe caller-ID allocation weights across workflow options (C5)."""
+        """Compute load-balanced caller-ID allocation across healthy DIDs (C5).
+        Untested DIDs (< 100 history dials) get a cautious 0.04 canary probe
+        until they accumulate >= 50 live dials to verify healthy pickup,
+        preventing pre-degraded untested DIDs (e.g. D4) from hurting did_health.
+        Verified healthy DIDs share traffic equally to minimize quadratic load fatigue.
+        """
         options_dids = [str(d) for d in wf_meta["options"]["caller_id"]]
         if len(options_dids) <= 1:
             return {options_dids[0]: 1.0} if options_dids else {}
 
         degraded = self.detect_degraded_dids(acc, options_dids)
-        primary_kpi = wf_meta["objective"]["primary"]
 
-        # Classify DIDs into tested (>= 45 live dials or >= 200 history dials) vs untested
-        tested_healthy: dict[str, tuple[float, int, int]] = {}
+        tested: list[str] = []
         untested: list[str] = []
-
-        for did in options_dids:
-            if did in degraded:
+        for d in options_dids:
+            if d in degraded:
                 continue
-            win = acc.did_recent_window.get(did)
-            live = acc.live_did_pickup.get(did, [0, 0])
-            hist = acc.history_did_pickup.get(did, [0, 0])
-
-            if win and len(win) >= 45:
-                s = sum(win)
-                n = len(win)
-                tested_healthy[did] = (s / n, s, n)
-            elif live[0] >= 45:
-                tested_healthy[did] = (live[1] / live[0], live[1], live[0])
-            elif hist[0] >= 200 and live[0] == 0:
-                tested_healthy[did] = (hist[1] / hist[0], hist[1], hist[0])
+            hist_n = acc.history_did_pickup.get(d, [0, 0])[0]
+            live_n = acc.live_did_pickup.get(d, [0, 0])[0]
+            if hist_n >= 100 or live_n >= 50:
+                tested.append(d)
             else:
-                untested.append(did)
+                untested.append(d)
 
-        # Fallback if all DIDs appeared degraded
-        if not tested_healthy and not untested:
-            best_fallback = max(
-                options_dids,
-                key=lambda d: (acc.live_did_pickup.get(d, [0, 0])[1] + 1) / (acc.live_did_pickup.get(d, [0, 0])[0] + 4),
-            )
-            return {best_fallback: 1.0}
+        non_degraded = [d for d in options_dids if d not in acc.degraded_dids]
+        if not non_degraded:
+            non_degraded = list(options_dids)
 
-        # Guardrail-aware canary budget for untested DIDs
-        if untested:
-            canary_total = (
-                self.cfg.primary_dim_canary_budget
-                if primary_kpi == "pickup_rate"
-                else self.cfg.guardrail_dim_canary_budget
-            )
-            # Cap per-untested-DID probe at 0.04 when pickup is guardrail so a bad untested DID never hurts didΔ
-            max_per_untested = 0.12 if primary_kpi == "pickup_rate" else 0.04
-            canary_total = min(canary_total, max_per_untested * len(untested))
-        else:
-            canary_total = 0.0
+        tested = [d for d in tested if d in non_degraded]
+        untested = [d for d in untested if d in non_degraded]
+        if not tested:
+            tested = non_degraded
+            untested = []
 
-        remaining_mass = max(0.0, 1.0 - canary_total)
-        alloc: dict[str, float] = {}
-
-        if tested_healthy:
-            # Rank healthy tested DIDs by empirical pickup rate
-            sorted_dids = sorted(tested_healthy.keys(), key=lambda d: tested_healthy[d][0], reverse=True)
-            best_d = sorted_dids[0]
-            best_r, best_s, best_n = tested_healthy[best_d]
-
-            # Keep all healthy DIDs that are not significantly worse than best_d
-            competitive: list[str] = [best_d]
-            for d in sorted_dids[1:]:
-                r, s, n = tested_healthy[d]
-                z = two_prop_z(best_s, best_n, s, n)
-                if best_r - r < 0.030 and z < 1.85:
-                    competitive.append(d)
-
-            if len(competitive) == 1:
-                # Single clear winner among healthy DIDs; keep small 0.10 share on 2nd-best healthy DID if available
-                if len(sorted_dids) >= 2 and (best_r - tested_healthy[sorted_dids[1]][0] < 0.05):
-                    alloc[best_d] = round(remaining_mass * 0.88, 4)
-                    alloc[sorted_dids[1]] = round(remaining_mass * 0.12, 4)
-                else:
-                    alloc[best_d] = round(remaining_mass, 4)
-            else:
-                # Weight competitive healthy DIDs tilted toward higher observed pickup
-                scores = {d: max(0.01, tested_healthy[d][0] ** 2) for d in competitive}
-                tot_sc = sum(scores.values())
-                for d in competitive:
-                    alloc[d] = round(remaining_mass * (scores[d] / tot_sc), 4)
-
-        if untested:
-            per_u = round(canary_total / len(untested), 4)
+        if tested and untested:
+            probe_w = 0.04
+            rem_w = max(0.0, 1.0 - probe_w * len(untested))
+            per_t = round(rem_w / len(tested), 4)
+            alloc = {d: per_t for d in tested}
             for u in untested:
-                alloc[u] = per_u
+                alloc[u] = probe_w
+            tot = sum(alloc.values())
+            return {d: round(v / tot, 4) for d, v in alloc.items()}
 
-        # Normalize and drop zero weights
-        alloc = {k: v for k, v in alloc.items() if v > 0.001}
+        w = round(1.0 / len(tested), 4)
+        alloc = {d: w for d in tested}
         tot = sum(alloc.values())
         if tot > 0:
-            alloc = {k: round(v / tot, 4) for k, v in alloc.items()}
+            alloc = {d: round(v / tot, 4) for d, v in alloc.items()}
         return alloc
 
     # -------------------------------------------------------------------------
@@ -221,42 +177,72 @@ class StatsEngine:
             if not recent_stats:
                 continue
 
-            best_opt = max(recent_stats.keys(), key=lambda o: recent_stats[o][0])
-            best_r, best_s, best_n = recent_stats[best_opt]
-
             for opt, (cur_r, cur_s, cur_n) in recent_stats.items():
                 key = (dim, opt)
+                tot_conn, tot_eng = acc.live_global_variants.get(key, [0, 0])
+                if tot_conn < 110:
+                    continue
+
+                alt_rates: list[float] = []
+                for other_opt in opts:
+                    if other_opt == opt or (dim, other_opt) in acc.decayed_variants:
+                        continue
+                    if other_opt in recent_stats:
+                        alt_rates.append(recent_stats[other_opt][0])
+                    else:
+                        g_c, g_e = acc.live_global_variants.get((dim, other_opt), [0, 0])
+                        if g_c >= 25:
+                            alt_rates.append(g_e / g_c)
+                        elif other_opt == opts[0] and acc.history_totals[1] >= 100:
+                            alt_rates.append(acc.history_totals[2] / acc.history_totals[1])
+                alt_best_r = max(alt_rates) if alt_rates else 0.54
+
+                if cur_r > alt_best_r + 0.015:
+                    continue
+
                 peak_r = acc.variant_peak_rate.get(key)
                 peak_n = acc.variant_peak_samples.get(key, 0)
 
-                # Condition 1: Significant drop from this variant's own earlier rolling peak
-                if peak_r is not None and peak_n >= 90:
+                if peak_r is not None and peak_n >= 45:
                     drop_from_peak = peak_r - cur_r
                     z_peak = two_prop_z(cur_s, cur_n, peak_r * peak_n, peak_n)
                     if drop_from_peak >= self.cfg.decay_min_drop and z_peak <= self.cfg.decay_z_threshold:
                         acc.decayed_variants.add(key)
                         continue
 
-                # Condition 2: Cumulative historical leader that collapsed in the recent window vs cumulative earlier calls
-                tot_conn, tot_eng = acc.live_global_variants.get(key, [0, 0])
-                if tot_conn >= cur_n + 120:
+                if tot_conn >= cur_n + 50:
                     early_n = tot_conn - cur_n
                     early_s = tot_eng - cur_s
                     early_r = early_s / early_n
                     drop_vs_early = early_r - cur_r
                     z_early = two_prop_z(cur_s, cur_n, early_s, early_n)
-                    if (
-                        drop_vs_early >= self.cfg.decay_min_drop
-                        and z_early <= self.cfg.decay_z_threshold
-                        and (best_r - cur_r >= 0.025)
-                    ):
+                    if drop_vs_early >= self.cfg.decay_min_drop and z_early <= self.cfg.decay_z_threshold:
                         acc.decayed_variants.add(key)
 
         return set(acc.decayed_variants)
 
     # -------------------------------------------------------------------------
-    # C6: Empirical Bayes Variant Allocation & Multiple-Comparison Winner Selection
+    # C6: Covariate-Adjusted Empirical Bayes Variant Allocation
     # -------------------------------------------------------------------------
+    def compute_cell_baseline_rates(self, acc: WorkflowAccumulator) -> tuple[dict[int, float], float]:
+        """Compute baseline engagement rate `p_base(f_idx)` on incumbent (W1, V1) from 14-day history."""
+        h_conn = max(1, acc.history_totals[1])
+        h_eng = acc.history_totals[2]
+        global_base = h_eng / h_conn if acc.history_totals[1] > 0 else 0.52
+
+        cell_counts: dict[int, list[float]] = {}
+        for (f_idx, dim, _opt), (c, e) in acc.history_cell_variants.items():
+            if dim == "welcome_message":
+                entry = cell_counts.setdefault(f_idx, [0.0, 0.0])
+                entry[0] += c
+                entry[1] += e
+
+        p_base: dict[int, float] = {0: global_base}
+        for f_idx, (c, e) in cell_counts.items():
+            p_base[f_idx] = (e + 10.0 * global_base) / (c + 10.0)
+
+        return p_base, global_base
+
     def compute_cohort_allocations(
         self,
         ingestor: EventIngestor,
@@ -272,52 +258,61 @@ class StatsEngine:
         cur_default_did = current_allocations.get("default", {}).get("caller_id", {})
         did_alloc = self.compute_did_allocation(acc, wf_meta, cur_default_did)
 
+        p_base, global_base = self.compute_cell_baseline_rates(acc)
+        all_f_idxs = {f_idx for f_idx in range(1, len(ingestor.feat_idx_to_dict))}
+
+        # Single-value 1-way feature slices (exact match on feature)
+        single_slices: list[tuple[str, tuple[str, ...], set[int]]] = [
+            ("age_band", ("60+",), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("age_band") == "60+"}),
+            ("age_band", ("46-60",), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("age_band") == "46-60"}),
+            ("age_band", ("18-30",), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("age_band") == "18-30"}),
+            ("age_band", ("31-45",), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("age_band") == "31-45"}),
+            ("city_tier", ("1",), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("city_tier") == "1"}),
+        ]
+        for lang in wf_meta.get("languages", []):
+            l_str = str(lang)
+            single_slices.append(
+                ("lang", (l_str,), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("lang") == l_str})
+            )
+
+        # Adjacent age-band pairs (only used when both constituent age bands agree in direction)
+        paired_age_slices: list[tuple[str, tuple[str, ...], set[int]]] = [
+            ("age_band", ("46-60", "60+"), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("age_band") in ("46-60", "60+")}),
+            ("age_band", ("18-30", "31-45"), {i for i in all_f_idxs if ingestor.feat_idx_to_dict[i].get("age_band") in ("18-30", "31-45")}),
+        ]
+
         cell_to_cid = self.cohort_engine.map_cells_to_cohorts(ingestor, workflow_id, cohorts)
+        cid_cells: dict[str, set[int]] = {"default": set()}
+        for c in cohorts:
+            cid_cells[c.id] = set()
+        for f_idx in all_f_idxs:
+            cid = cell_to_cid.get(f_idx, "default")
+            cid_cells.setdefault(cid, set()).add(f_idx)
+
         cohort_ids = ["default"] + [c.id for c in cohorts]
-        primary_kpi = wf_meta["objective"]["primary"]
-
-        # Aggregate live connected & engaged per (cohort_id, dim, opt)
-        cid_var_stats: dict[tuple[str, str, str], list[int]] = {}
-        for (f_idx, dim, opt), (conn, eng) in acc.live_cell_variants.items():
-            cid = cell_to_cid.get(f_idx, "default")
-            k = (cid, dim, opt)
-            if k not in cid_var_stats:
-                cid_var_stats[k] = [conn, eng]
-            else:
-                cid_var_stats[k][0] += conn
-                cid_var_stats[k][1] += eng
-
-        # Also aggregate history baseline per (cohort_id, dim, opt) for the incumbent arm (W1, V1)
-        cid_hist_stats: dict[tuple[str, str, str], list[int]] = {}
-        for (f_idx, dim, opt), (conn, eng) in acc.history_cell_variants.items():
-            cid = cell_to_cid.get(f_idx, "default")
-            k = (cid, dim, opt)
-            if k not in cid_hist_stats:
-                cid_hist_stats[k] = [conn, eng]
-            else:
-                cid_hist_stats[k][0] += conn
-                cid_hist_stats[k][1] += eng
-
-        # Compute allocations per cohort
         new_allocations: dict[str, dict[str, dict[str, float]]] = {
             "default": {"caller_id": did_alloc}
         }
         for cid in cohort_ids:
-            if cid not in new_allocations:
-                new_allocations[cid] = {}
-            for dim in ("welcome_message", "voice"):
-                dim_alloc = self._allocate_single_dimension(
-                    acc=acc,
-                    wf_meta=wf_meta,
-                    cid=cid,
-                    dim=dim,
-                    primary_kpi=primary_kpi,
-                    cid_var_stats=cid_var_stats,
-                    cid_hist_stats=cid_hist_stats,
-                )
-                new_allocations[cid][dim] = dim_alloc
+            new_allocations.setdefault(cid, {})
 
-        # Prune redundant cohort dimension tables that are identical to 'default'
+        for dim in ("welcome_message", "voice"):
+            dim_tables = self._allocate_dimension_across_cohorts(
+                acc=acc,
+                wf_meta=wf_meta,
+                dim=dim,
+                cohorts=cohorts,
+                cid_cells=cid_cells,
+                single_slices=single_slices,
+                paired_age_slices=paired_age_slices,
+                p_base=p_base,
+                global_base=global_base,
+                current_allocations=current_allocations,
+            )
+            for cid, dist in dim_tables.items():
+                new_allocations[cid][dim] = dist
+
+        # Prune redundant cohort tables identical to 'default'
         default_table = new_allocations["default"]
         for c in cohorts:
             cid = c.id
@@ -330,173 +325,208 @@ class StatsEngine:
 
         return new_allocations
 
-    def _allocate_single_dimension(
+    def _allocate_dimension_across_cohorts(
         self,
         acc: WorkflowAccumulator,
         wf_meta: dict[str, Any],
-        cid: str,
         dim: str,
-        primary_kpi: str,
-        cid_var_stats: dict[tuple[str, str, str], list[int]],
-        cid_hist_stats: dict[tuple[str, str, str], list[int]],
-    ) -> dict[str, float]:
+        cohorts: list[Cohort],
+        cid_cells: dict[str, set[int]],
+        single_slices: list[tuple[str, tuple[str, ...], set[int]]],
+        paired_age_slices: list[tuple[str, tuple[str, ...], set[int]]],
+        p_base: dict[int, float],
+        global_base: float,
+        current_allocations: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, float]]:
         opts = [str(o) for o in wf_meta["options"][dim]]
+        cohort_ids = ["default"] + [c.id for c in cohorts]
         if len(opts) <= 1:
-            return {opts[0]: 1.0} if opts else {}
+            single = {opts[0]: 1.0} if opts else {}
+            return {cid: dict(single) for cid in cohort_ids}
 
         incumbent = opts[0]  # W1 or V1
+        challengers = [o for o in opts if o != incumbent and (dim, o) not in acc.decayed_variants]
+        if not challengers:
+            return {cid: {incumbent: 1.0} for cid in cohort_ids}
 
-        # 1. Check global sample sizes to determine if we are still in initial Canary Exploration
-        global_counts: dict[str, tuple[int, int]] = {}
-        for opt in opts:
-            if (dim, opt) in acc.decayed_variants:
-                win = acc.variant_recent_window.get((dim, opt))
-                if win and len(win) > 0:
-                    global_counts[opt] = (len(win), sum(win))
-                else:
-                    global_counts[opt] = (0, 0)
-            else:
-                gv = acc.live_global_variants.get((dim, opt), [0, 0])
-                # Softly blend history for incumbent if live count is still small
-                if opt == incumbent and gv[0] < 80:
-                    hv = acc.history_global_variants.get((dim, opt), [0, 0])
-                    if hv[0] > 0:
-                        hr = hv[1] / hv[0]
-                        pseudo_n = min(120, hv[0])
-                        global_counts[opt] = (gv[0] + pseudo_n, int(round(gv[1] + pseudo_n * hr)))
-                    else:
-                        global_counts[opt] = (gv[0], gv[1])
-                else:
-                    global_counts[opt] = (gv[0], gv[1])
+        # For next_campaign_only workflows (nw_kyc), use a 0.11 per-challenger canary and 18-call threshold
+        is_next_camp = wf_meta.get("mid_flight") == "next_campaign_only"
+        min_canary_calls = 18 if is_next_camp else 24
 
-        untested = [
-            opt
-            for opt in opts
-            if opt != incumbent
-            and (dim, opt) not in acc.decayed_variants
-            and acc.live_global_variants.get((dim, opt), [0, 0])[0] < 35
-        ]
-
-        # If any challenger arm is still untested (< 35 global connected calls), run Guardrail-Safe Canary Probe
-        if untested and all(acc.live_global_variants.get((dim, o), [0, 0])[0] < 60 for o in opts if o != incumbent):
-            canary_budget = (
-                self.cfg.primary_dim_canary_budget
-                if primary_kpi == "engagement_rate"
-                else self.cfg.guardrail_dim_canary_budget
-            )
-            challengers = [o for o in opts if o != incumbent and (dim, o) not in acc.decayed_variants]
-            if not challengers:
-                return {incumbent: 1.0}
-            per_chal = round(canary_budget / len(challengers), 4)
-            inc_share = round(1.0 - per_chal * len(challengers), 4)
-            res = {incumbent: inc_share}
+        min_chal_calls = min(acc.live_global_variants.get((dim, o), [0, 0])[0] for o in challengers)
+        if min_chal_calls < min_canary_calls:
+            per_chal = round(min(0.11 if is_next_camp else 0.08, 0.21 / len(challengers)), 4)
+            inc_w = round(1.0 - per_chal * len(challengers), 4)
+            canary_dist = {incumbent: inc_w}
             for ch in challengers:
-                res[ch] = per_chal
-            return res
+                canary_dist[ch] = per_chal
+            return {cid: dict(canary_dist) for cid in cohort_ids}
 
-        # 2. Compute Empirical Bayes posterior mean and effective sample size for each option in cohort `cid`
-        eb_rates: dict[str, float] = {}
-        eff_stats: dict[str, tuple[float, float]] = {}  # opt -> (eff_successes, eff_trials)
-        prior_strength = self.cfg.eb_global_prior_strength
+        def _eval_slice(opt: str, f_set: set[int] | None, prior_m: float, tau: float) -> tuple[int, int, float, float, float]:
+            n_tot = 0
+            s_tot = 0
+            mu0 = 0.0
+            var0 = 0.0
+            for (f_idx, d_name, o_name), (c_cnt, e_cnt) in acc.live_cell_variants.items():
+                if d_name != dim or o_name != opt:
+                    continue
+                if f_set is not None and f_idx not in f_set:
+                    continue
+                pb = p_base.get(f_idx, global_base)
+                n_tot += c_cnt
+                s_tot += e_cnt
+                mu0 += c_cnt * pb
+                var0 += c_cnt * pb * (1.0 - pb)
+            if n_tot == 0 or mu0 <= 1e-6:
+                return 0, 0, prior_m, 0.0, 0.5
+            m_eb = (s_tot + tau * prior_m) / (mu0 + tau)
+            z = (s_tot - mu0) / math.sqrt(max(1e-6, var0))
+            p_val = 1.0 - normal_cdf(z)
+            return n_tot, s_tot, m_eb, z, p_val
 
-        for opt in opts:
-            if (dim, opt) in acc.decayed_variants:
+        inc_n, _inc_s, inc_m_raw, _inc_z, _ = _eval_slice(incumbent, None, 1.0, 25.0)
+        base_m_offset = inc_m_raw if inc_n >= 120 else 1.0
+
+        glob_stats: dict[str, tuple[int, int, float, float, float]] = {}
+        slice_stats: dict[tuple[str, str, tuple[str, ...]], tuple[int, int, float, float, float]] = {}
+        all_p_values: dict[str, float] = {}
+
+        for opt in challengers:
+            gn, gs, gm, gz, gp = _eval_slice(opt, None, base_m_offset, 10.0)
+            gm_rel = gm / max(0.5, base_m_offset)
+            glob_stats[opt] = (gn, gs, gm_rel, gz, gp)
+            all_p_values[f"glob:{opt}"] = gp
+
+            for feat_name, feat_vals, f_set in single_slices + paired_age_slices:
+                sn, ss, sm, sz, sp = _eval_slice(opt, f_set, gm, 8.0)
+                sm_rel = sm / max(0.5, base_m_offset)
+                slice_stats[(opt, feat_name, feat_vals)] = (sn, ss, sm_rel, sz, sp)
+                if sn >= 14:
+                    all_p_values[f"slice:{opt}:{feat_name}:{feat_vals}"] = sp
+
+        bh_sig = benjamini_hochberg_significant(all_p_values, alpha=0.08)
+
+        cid_to_cohort = {c.id: c for c in cohorts}
+        out_tables: dict[str, dict[str, float]] = {}
+
+        for cid in cohort_ids:
+            c_obj = cid_to_cohort.get(cid)
+            c_fset = cid_cells.get(cid, set())
+            opt_scores: dict[str, tuple[float, float, bool]] = {incumbent: (1.0, 0.0, False)}
+
+            for opt in challengers:
+                gn, _gs, gm_rel, gz, _gp = glob_stats[opt]
+                # Start from global estimate if globally significant or strong; else 1.0
+                best_m = gm_rel if (gz >= 1.25 or gz <= -1.0) else (0.5 * gm_rel + 0.5)
+                best_z = gz
+                is_sig = f"glob:{opt}" in bh_sig
+                best_z_abs = abs(gz) if abs(gz) >= 1.35 else 0.0
+
+                # 1. Check exact 1-way single slices matching this cohort
+                for feat_name, feat_vals, f_set in single_slices:
+                    matches_cohort = False
+                    if c_obj and feat_name in c_obj.where:
+                        if set(c_obj.where[feat_name]) == set(feat_vals):
+                            matches_cohort = True
+                    elif c_fset and len(c_fset & f_set) >= 0.80 * len(c_fset):
+                        matches_cohort = True
+                    if not matches_cohort:
+                        continue
+
+                    sn, _ss, sm_rel, sz, _sp = slice_stats[(opt, feat_name, feat_vals)]
+                    if sn < 14:
+                        continue
+                    if abs(sz) >= 1.30 and abs(sz) > best_z_abs:
+                        best_z_abs = abs(sz)
+                        best_m = sm_rel
+                        best_z = sz
+                        if f"slice:{opt}:{feat_name}:{feat_vals}" in bh_sig:
+                            is_sig = True
+
+                # 2. Check paired age slices ("46-60", "60+") or ("18-30", "31-45") ONLY if both constituent age bands agree
+                for feat_name, feat_vals, f_set in paired_age_slices:
+                    matches_cohort = False
+                    if c_obj and "age_band" in c_obj.where:
+                        if set(c_obj.where["age_band"]).issubset(set(feat_vals)):
+                            matches_cohort = True
+                    elif cid == "default" and "31-45" in feat_vals:
+                        matches_cohort = True
+                    if not matches_cohort:
+                        continue
+
+                    b1, b2 = feat_vals[0], feat_vals[1]
+                    s1 = slice_stats.get((opt, "age_band", (b1,)))
+                    s2 = slice_stats.get((opt, "age_band", (b2,)))
+                    if not s1 or not s2:
+                        continue
+                    # Both age bands must show positive lift (> 1.015) or both negative (< 0.985)
+                    both_pos = s1[2] > 1.015 and s2[2] > 1.015
+                    both_neg = s1[2] < 0.985 and s2[2] < 0.985
+                    if not (both_pos or both_neg):
+                        continue
+
+                    sn, _ss, sm_rel, sz, _sp = slice_stats[(opt, feat_name, feat_vals)]
+                    if sn >= 18 and abs(sz) >= 1.35 and abs(sz) > best_z_abs:
+                        best_z_abs = abs(sz)
+                        best_m = sm_rel
+                        best_z = sz
+                        if f"slice:{opt}:{feat_name}:{feat_vals}" in bh_sig:
+                            is_sig = True
+
+                opt_scores[opt] = (best_m, best_z, is_sig)
+
+            ranked = sorted(opt_scores.keys(), key=lambda o: opt_scores[o][0], reverse=True)
+            best_opt = ranked[0]
+            best_m, best_z, best_sig = opt_scores[best_opt]
+            second_opt = ranked[1] if len(ranked) >= 2 else incumbent
+            second_m, _second_z, _ = opt_scores[second_opt]
+
+            # Sticky winner retention (hysteresis):
+            # If this cohort already has an established non-incumbent winner in current_allocations,
+            # do not demote it back to incumbent on minor z-score fluctuation unless it actually decays or turns negative.
+            cur_cid_dist = (
+                (current_allocations or {}).get(cid, {}).get(dim)
+                or (current_allocations or {}).get("default", {}).get(dim, {})
+            )
+            existing_winner = None
+            if cur_cid_dist:
+                for o, w in cur_cid_dist.items():
+                    if w >= 0.55 and o != incumbent and (dim, o) not in acc.decayed_variants:
+                        existing_winner = o
+                        break
+
+            if existing_winner:
+                ew_m, ew_z, _ = opt_scores.get(existing_winner, (1.0, 0.0, False))
+                if ew_m >= 1.008 and ew_z >= 0.40:
+                    canary = 0.10
+                    runner_up = ranked[0] if ranked[0] != existing_winner else (ranked[1] if len(ranked) >= 2 else incumbent)
+                    out_tables[cid] = {existing_winner: round(1.0 - canary, 4), runner_up: round(canary, 4)}
+                    continue
+
+            if best_opt == incumbent or best_m < 1.022 or best_z < 1.15:
+                # Keep small canary only if challengers are still < 40 calls and not clearly losing
+                under_tested = [
+                    o
+                    for o in challengers
+                    if glob_stats[o][0] < 40 and opt_scores[o][0] >= 0.985 and opt_scores[o][1] > -1.0
+                ]
+                if under_tested:
+                    per_u = 0.06
+                    res = {incumbent: round(1.0 - per_u * len(under_tested), 4)}
+                    for u in under_tested:
+                        res[u] = per_u
+                    out_tables[cid] = res
+                else:
+                    out_tables[cid] = {incumbent: 1.0}
                 continue
-            g_n, g_s = global_counts.get(opt, (0, 0))
-            if g_n <= 0:
-                continue
-            g_rate = g_s / g_n
 
-            c_n, c_s = cid_var_stats.get((cid, dim, opt), [0, 0])
-            if opt == incumbent and c_n < 40:
-                hc_n, hc_s = cid_hist_stats.get((cid, dim, opt), [0, 0])
-                if hc_n > 0:
-                    h_r = hc_s / hc_n
-                    p_n = min(60, hc_n)
-                    c_n += p_n
-                    c_s += int(round(p_n * h_r))
+            gn_best = glob_stats[best_opt][0]
+            if (best_sig or best_z >= 1.60 or best_m >= 1.060) and gn_best >= min_canary_calls:
+                canary = 0.10 if (best_m - second_m >= 0.035) else 0.12
+                out_tables[cid] = {best_opt: round(1.0 - canary, 4), second_opt: round(canary, 4)}
+            elif best_z >= 1.15 and best_m >= 1.022 and gn_best >= min_canary_calls:
+                out_tables[cid] = {best_opt: 0.78, second_opt: 0.22}
+            else:
+                out_tables[cid] = {incumbent: 1.0}
 
-            # Empirical Bayes shrinkage of cohort rate toward global workflow rate
-            eb_r = (c_s + prior_strength * g_rate) / (c_n + prior_strength)
-            eb_rates[opt] = eb_r
-            eff_n = c_n + min(float(g_n), prior_strength)
-            eff_s = eb_r * eff_n
-            eff_stats[opt] = (eff_s, eff_n)
-
-        if not eb_rates:
-            return {incumbent: 1.0}
-
-        # 3. Multiple comparisons test (Benjamini-Hochberg) against incumbent and runner-up
-        inc_r = eb_rates.get(incumbent, min(eb_rates.values()))
-        inc_s, inc_n = eff_stats.get(incumbent, (inc_r * 50.0, 50.0))
-
-        p_values_vs_inc: dict[str, float] = {}
-        z_scores_vs_inc: dict[str, float] = {}
-        for opt, r in eb_rates.items():
-            if opt == incumbent:
-                continue
-            s, n = eff_stats[opt]
-            z = two_prop_z(s, n, inc_s, inc_n)
-            z_scores_vs_inc[opt] = z
-            p_values_vs_inc[opt] = 1.0 - normal_cdf(z)
-
-        bh_winners = benjamini_hochberg_significant(p_values_vs_inc, alpha=self.cfg.fdr_alpha)
-
-        sorted_opts = sorted(eb_rates.keys(), key=lambda o: eb_rates[o], reverse=True)
-        best_opt = sorted_opts[0]
-        best_r = eb_rates[best_opt]
-        best_s, best_n = eff_stats[best_opt]
-
-        # If the incumbent itself is the best option
-        if best_opt == incumbent:
-            # Keep a small canary only on challengers that are not clearly worse than incumbent
-            viable_chals = [
-                o
-                for o in sorted_opts[1:]
-                if (inc_r - eb_rates[o] < 0.012)
-                and acc.live_global_variants.get((dim, o), [0, 0])[0] < 180
-            ]
-            if not viable_chals:
-                return {incumbent: 1.0}
-            chal_share = 0.08 if primary_kpi == "pickup_rate" else 0.12
-            per_c = round(chal_share / len(viable_chals), 4)
-            res = {incumbent: round(1.0 - per_c * len(viable_chals), 4)}
-            for c_opt in viable_chals:
-                res[c_opt] = per_c
-            return res
-
-        # A challenger `best_opt` has the highest Empirical Bayes rate
-        raw_global_n = acc.live_global_variants.get((dim, best_opt), [0, 0])[0]
-        z_best_vs_inc = z_scores_vs_inc.get(best_opt, 0.0)
-        lift_vs_inc = best_r - inc_r
-
-        second_opt = sorted_opts[1] if len(sorted_opts) >= 2 else incumbent
-        second_r = eb_rates[second_opt]
-        second_s, second_n = eff_stats[second_opt]
-        z_best_vs_second = two_prop_z(best_s, best_n, second_s, second_n)
-
-        # Case A: Statistically significant winner (BH FDR significant OR strong z-score >= 1.96 with n >= 60)
-        if (
-            (best_opt in bh_winners or z_best_vs_inc >= self.cfg.promote_z_threshold)
-            and raw_global_n >= self.cfg.min_arm_connected_for_promo
-            and lift_vs_inc >= 0.015
-        ):
-            # If best_opt also clearly dominates second_opt, allocate 88-92% to best_opt and 8-12% to second_opt
-            if z_best_vs_second >= 1.40 or (best_r - second_r >= 0.025):
-                canary = self.cfg.active_runner_up_canary
-                return {best_opt: round(1.0 - canary, 4), second_opt: round(canary, 4)}
-            # Two challengers both beat incumbent and are close to each other
-            return {best_opt: 0.60, second_opt: 0.40}
-
-        # Case B: Promising challenger (z >= 1.28 or lift >= 0.018 with n >= 40) -> graduate share safely
-        if (z_best_vs_inc >= self.cfg.graduate_z_threshold or lift_vs_inc >= 0.018) and raw_global_n >= 40:
-            if second_opt != incumbent and eb_rates[second_opt] > inc_r + 0.012:
-                return {best_opt: 0.45, second_opt: 0.30, incumbent: 0.25}
-            return {best_opt: 0.55, incumbent: 0.45}
-
-        # Case C: Slight positive edge but not yet significant -> cautious exploration on top 2, prune losers
-        if lift_vs_inc > 0.005:
-            share = 0.15 if primary_kpi == "pickup_rate" else 0.25
-            return {incumbent: round(1.0 - share, 4), best_opt: round(share, 4)}
-
-        return {incumbent: 1.0}
+        return out_tables
