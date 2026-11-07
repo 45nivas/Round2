@@ -1,0 +1,24 @@
+================================================================================
+CRASH RECOVERY VERIFICATION TEST (C13) — scenario: public_01_dev
+================================================================================
+
+[Phase 1] Launching controller #1 with --kill-at-minute 4320 (Day 3 00:00)...
+  Controller #1 exited with code=137 after 13.32s (expected 137 = SIGKILL/hard exit)
+  Simulator state at crash   : sim_minute=4800 (2027-01-07T08:00:00+05:30)
+  SQLite WAL checkpoint      : sim_minute=4800, last_history_chunk=0, last_event_chunk=137, last_event_id=228521
+  Audit records pre-crash    : proposals=11 (pending=0), decisions_audit=33
+
+[Phase 2] Restarting controller #2 from SQLite WAL checkpoint to completion...
+  Controller #2 exited cleanly with code=0 after 18.56s
+  Controller #2 stdout: [controller] Completed scenario=public_01_dev at sim_minute=11520 (2027-01-12T00:00:00+05:30) credits_remaining=200.0
+  Simulator final state      : sim_minute=11520 (2027-01-12T00:00:00+05:30), finished=True
+  Final SQLite checkpoint    : sim_minute=11520, last_event_chunk=362, last_event_id=297054
+  Final audit records        : proposals=20, decisions_audit=51
+
+[Phase 3] Grading crash-recovered run against baseline (runs/base_public_01_dev)...
+  Scenario finished minute   : 11520 (expected 10080)
+  Overall KPI Δ vs baseline  : conclusion=+5.6%, pickup=+3.1%, engagement=+2.0%
+  Controller change verdicts : {"neutral": 12, "beneficial": 12, "harmful": 7}
+  Governance summary         : {"approval_requests": 20, "decisions": {"approved": 16, "rejected": 4, "expired": 0}, "rejection_reasons": {"approver declined (judgement call)": 4}, "applied_via_approval": 16, "auto_applied": 15, "auto_apply_rejected": 0, "apply_conflicts": 0, "lapsed": 0, "peak_requests_per_24h": {"nw_renewal": 2, "ks_cancel": 4, "nw_kyc": 2}}
+
+[PASS] Crash recovery verified: 0 conflicts, 0 lapsed approvals, 0 rejected auto-applies, 0 harmful changes.
